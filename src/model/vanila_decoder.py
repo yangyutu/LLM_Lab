@@ -9,7 +9,7 @@ from omegaconf import OmegaConf
 import tiktoken
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, d_model, context_length, num_heads, dropout, qkv_bias=False):
+    def __init__(self, d_model, context_length, num_heads, dropout, qkv_bias=False, causal_attention=True):
         super().__init__()
         
         assert d_model % num_heads == 0
@@ -26,7 +26,10 @@ class MultiHeadAttention(nn.Module):
         
         # Buffers are not updated during training but are part of the module's state.
         # Use diagonal= 1 to set diagonal elements to be zero
-        self.register_buffer("mask", torch.triu(torch.ones(context_length, context_length), diagonal=1))
+        self.causal_attention = causal_attention
+        
+        if self.causal_attention:
+            self.register_buffer("mask", torch.triu(torch.ones(context_length, context_length), diagonal=1))
         
     def forward(self, x):
         # x shape: (batch_size, num_tokens, d_model)
@@ -49,21 +52,22 @@ class MultiHeadAttention(nn.Module):
         
         # key to shape: (batch_size, num_heads,  d_head, num_tokens)
         # attention_logits : (batch_size, num_heads, num_tokens, num_tokens)
-        attention_logits = queries @ keys.transpose(2, 3) / queries.shape[-1] ** 0.5
+        attention_logits = queries @ keys.transpose(2, 3) / self.head_dim ** 0.5
         
-        mask_bool = self.mask.bool()[:num_tokens,:num_tokens]
-        
-        attention_logits.masked_fill(mask_bool, -torch.inf)
+        if self.causal_attention:
+            mask_bool = self.mask.bool()[:num_tokens,:num_tokens]
+            attention_logits.masked_fill(mask_bool, -torch.inf)
         
         attention_weights = torch.softmax(attention_logits, dim=-1)
         
         # attention_weights: (batch_size, num_heads, num_tokens, num_tokens)
+        # values: (batch_size, num_heads, num_tokens,  d_head)
         attention_weights = self.dropout(attention_weights)
         
         # context_vec: (batch_size, num_heads, num_tokens, d_head)
         context_vec = (attention_weights @ values)
         
-        context_vec = context_vec.transpose(2, 3).contiguous().view(batch_size, num_tokens, self.d_model)
+        context_vec = context_vec.transpose(1, 2).contiguous().view(batch_size, num_tokens, self.d_model)
         
         out_vec = self.W_O(context_vec)
         
@@ -79,7 +83,7 @@ class LayerNorm(nn.Module):
     def forward(self, x):
         mean = torch.mean(x, dim=-1, keepdim=True)
         var = torch.var(x, dim=-1, keepdim=True)
-        norm_x = (x - mean) / (var + self.eps) * self.scale + self.shift
+        norm_x = (x - mean) / torch.sqrt(var + self.eps) * self.scale + self.shift
         return norm_x
     
 class FeedForward(nn.Module):
@@ -107,7 +111,8 @@ class TransformerLayer(nn.Module):
                                       context_length=config.context_length, 
                                       num_heads=config.num_heads,
                                       dropout=config.dropout,
-                                      qkv_bias=config.qkv_bias)
+                                      qkv_bias=config.qkv_bias,
+                                      causal_attention=config.causal_attention)
         
         self.ff = FeedForward(d_model=config.d_model)
         self.norm1 = LayerNorm(d_model=config.d_model)
@@ -136,6 +141,7 @@ class TransformerLayer(nn.Module):
 class Decoder(nn.Module):
     def __init__(self, config):
         super().__init__()
+        print("vanilla decoder model 3")
         self.config = config
         # both token embedding and position embedding are learnable
         self.token_emb = nn.Embedding(config.vocab_size, config.d_model)
@@ -146,6 +152,17 @@ class Decoder(nn.Module):
         self.transformer_backbone = nn.Sequential(*[TransformerLayer(self.config) for _ in range(self.config.num_layers)])
         
         self.final_norm = LayerNorm(config.d_model)
+        
+        self.apply(self._init_weight_fn)
+        
+    def _init_weight_fn(self, module):
+        classname = module.__class__.__name__
+        if classname == "Linear":
+            module.weight.data.normal_(0.0, 0.02)
+            if module.bias is not None:
+                module.bias.data.fill_(0.0)
+        elif classname == "Embedding":
+            module.weight.data.normal_(0.0, 0.02)
 
 
     def forward(self, input_idx):

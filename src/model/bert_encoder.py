@@ -67,47 +67,35 @@ class EmbeddingLayer(nn.Module):
         return embedding
 
 
-class BertEncoder(nn.Module):
+class BertEncoderModel(nn.Module):
     def __init__(
         self,
-        tokenizer_config_name: str,
-        num_classes: int,
-        num_layers: int = 2,
-        truncate: int = 512,
-        embed_size: int = 128,
-        nhead: int = 2,
-        dim_feedforward: int = 512,
-        dim_model: int = 128,
-        dropout: float = 0.1,
-        position_encoding_type: str = "learnable",
-        pooled_output_embedding: bool = False,
+        config,
     ):
         super().__init__()
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            tokenizer_config_name, use_fast=True
-        )
-        self.truncate = truncate
-        self.num_layers = num_layers
-        self.dim_model = dim_model
-        self.pooled_output_embedding = pooled_output_embedding
+        print("custom BERT")
+        self.config = config
+        self.num_layers = config.num_layers
+        self.dim_model = config.dim_model
+        #self.pooled_output_embedding = pooled_output_embedding
         self.embedding_layer = EmbeddingLayer(
-            embed_size=embed_size,
-            vocab_size=self.tokenizer.vocab_size,
-            dropout=dropout,
-            position_encoding_type=position_encoding_type,
+            embed_size=config.embed_size,
+            vocab_size=config.vocab_size,
+            dropout=config.dropout,
+            position_encoding_type=config.position_encoding_type,
         )
-        config = AutoConfig.from_pretrained("bert-base-uncased")
-        config.update(
+        auto_config = AutoConfig.from_pretrained("bert-base-uncased")
+        auto_config.update(
             {
-                "num_attention_heads": nhead,
-                "hidden_size": dim_model,
-                "intermediate_size": dim_feedforward,
-                "num_hidden_layers": num_layers,
+                "num_attention_heads": config.nhead,
+                "hidden_size": config.dim_model,
+                "intermediate_size": config.dim_feedforward,
+                "num_hidden_layers": config.num_layers,
             }
         )
-        self.encoder = BertEncoder(config)
-        self.linear = nn.Linear(dim_model, num_classes)
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.encoder = BertEncoder(auto_config)
+        #self.linear = nn.Linear(config.dim_model, config.num_classes)
+        # self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.apply(self._init_weight_fn)
 
     def _init_weight_fn(self, module):
@@ -121,26 +109,16 @@ class BertEncoder(nn.Module):
             # m.weight.data shoud be taken from a normal distribution
             module.weight.data.normal_(0.0, 0.02)
 
-    def _mean_pooling(self, last_hidden_states, attention_mask):
-        token_embeddings = last_hidden_states
-        input_mask_expanded = (
-            attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
-        )
-        pooled_embedding = torch.sum(
-            token_embeddings * input_mask_expanded, axis=1
-        ) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
-        return pooled_embedding
-
-    def forward(self, text_list):
-        encoded_inputs = self.tokenizer(
-            text_list,
-            return_tensors="pt",
-            max_length=self.truncate,
-            truncation="longest_first",
-            padding="max_length",
-            add_special_tokens=False if self.pooled_output_embedding else True,
-        )
-        encoded_inputs = {k: v.to(self.device) for k, v in encoded_inputs.items()}
+    def forward(self, encoded_inputs):
+        # encoded_inputs = self.tokenizer(
+        #     text_list,
+        #     return_tensors="pt",
+        #     max_length=self.truncate,
+        #     truncation="longest_first",
+        #     padding="max_length",
+        #     add_special_tokens=False if self.pooled_output_embedding else True,
+        # )
+        # encoded_inputs = {k: v.to(self.device) for k, v in encoded_inputs.items()}
         embedding = self.embedding_layer(encoded_inputs["input_ids"])
         # convert original attention mask to additive attenion score mask
         atten_mask = encoded_inputs["attention_mask"]
@@ -154,12 +132,12 @@ class BertEncoder(nn.Module):
         mask = mask[:, None, None, :]
         embedding = self.encoder(embedding, attention_mask=mask)
         encoded_embeddings = embedding.last_hidden_state
-        if self.pooled_output_embedding:
-            representation = self._mean_pooling(
-                encoded_embeddings, encoded_inputs["attention_mask"]
-            )
-        else:
-            representation = encoded_embeddings[:, 0, :]
-        logit = self.linear(representation)
+        # if self.pooled_output_embedding:
+        #     representation = self._mean_pooling(
+        #         encoded_embeddings, encoded_inputs["attention_mask"]
+        #     )
+        # else:
+        #     representation = encoded_embeddings[:, 0, :]
+        #logits = self.linear(encoded_embeddings)
 
-        return predictions
+        return encoded_embeddings
