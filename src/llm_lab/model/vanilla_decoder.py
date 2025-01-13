@@ -138,7 +138,7 @@ class TransformerLayer(nn.Module):
         
         return x
     
-class Decoder(nn.Module):
+class VanillaDecoderModel(nn.Module):
     def __init__(self, config):
         super().__init__()
         print("vanilla decoder model 3")

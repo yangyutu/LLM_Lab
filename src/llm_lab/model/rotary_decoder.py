@@ -10,7 +10,7 @@ import transformers
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from functools import partial
 
-class LlamaRMSNorm(nn.Module):
+class RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         super().__init__()
         self.gamma = nn.Parameter(torch.ones(hidden_size))
@@ -52,7 +52,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
 
-class LlamaRotaryEmbedding(nn.Module):
+class RotaryEmbedding(nn.Module):
     def __init__(
         self,
         dim,
@@ -105,7 +105,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, seqlen, head_dim)
 
 
-class LlamaAttention(nn.Module):
+class GQAAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
     def __init__(self, config, layer_idx: Optional[int] = None):
@@ -193,16 +193,16 @@ class LlamaMLP(nn.Module):
         return down_proj
     
     
-class LlamaDecoderLayer(nn.Module):
+class RotaryDecoderLayer(nn.Module):
     def __init__(self, config, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
 
-        self.self_attn = LlamaAttention(config=config, layer_idx=layer_idx)
+        self.self_attn = GQAAttention(config=config, layer_idx=layer_idx)
         # FFN layer
         self.mlp = LlamaMLP(config)
-        self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -236,7 +236,7 @@ class LlamaDecoderLayer(nn.Module):
 
         return hidden_states
     
-class LlamaModel(nn.Module):
+class RotaryDecoderModel(nn.Module):
     """
     Transformer decoder consisting of *config.num_layers* layers. Each layer is a [`LlamaDecoderLayer`]
 
@@ -251,13 +251,13 @@ class LlamaModel(nn.Module):
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
-            [LlamaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_layers)]
+            [RotaryDecoderLayer(config, layer_idx) for layer_idx in range(config.num_layers)]
         )
         
         # apply to last layer hidden state
-        self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         # rotary embedding matrices are shared across the decoder layers
-        self.rotary_emb = LlamaRotaryEmbedding( dim=config.hidden_size // config.num_heads,
+        self.rotary_emb = RotaryEmbedding( dim=config.hidden_size // config.num_heads,
                                                 max_position_embeddings=config.max_position_embeddings,
                                                 base=config.rope_theta,)
 
