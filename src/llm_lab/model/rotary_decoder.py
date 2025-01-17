@@ -38,6 +38,7 @@ def rotate_half(x):
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
 
     # add a dimension to the cos and sin tensors to account for the number of heads
+    # from (batch_size, seq_len, dim) to (batch_size, 1, seq_len, dim)
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
     # Here has a different order in the frequency dimension, as described in the paper https://arxiv.org/pdf/2104.09864 page 7
@@ -73,7 +74,7 @@ class RotaryEmbedding(nn.Module):
         self.original_inv_freq = self.inv_freq
 
     @torch.no_grad()
-    def forward(self, x, position_ids):
+    def forward(self, position_ids, datatype):
         # Core RoPE block
         # Use None to add two new dimensions to the inv_freq
         # use expand to repeat the inv_freq along the batch dimension
@@ -90,7 +91,7 @@ class RotaryEmbedding(nn.Module):
         cos = emb.cos()
         sin = emb.sin()
 
-        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+        return cos.to(dtype=datatype), sin.to(dtype=datatype)
 
 # utility function for Group query attention
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -120,19 +121,27 @@ class GQAAttention(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
-        self.rope_theta = config.rope_theta
-        self.is_causal = True
+        self.causal_attention = config.causal_attention
 
         # Here supports GQA, which specifies the number of key value heads << num_heads
         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.qkv_bias)
         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.qkv_bias)
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.qkv_bias)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.o_bias)
-
+        
+        if self.causal_attention:
+            self.register_buffer("mask", torch.triu(torch.ones(config.max_position_embeddings, config.max_position_embeddings), diagonal=1))
+        
+        if config.get("use_cache", False):
+            self.cache_k = torch.zeros((config.max_batch_size, config.max_seq_len, config.num_key_value_heads, self.head_dim))
+            self.cache_v = torch.zeros((config.max_batch_size, config.max_seq_len, config.num_key_value_heads, self.head_dim))
+            
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, 
+        use_cache: bool = False,
+        start_pos: int = 0
     ):
         bsz, q_len, _ = hidden_states.size()
 
@@ -148,9 +157,17 @@ class GQAAttention(nn.Module):
 
         # Get the rotary embeddings cosines and sines functions
         cos, sin = position_embeddings
-
+               
         # apply the rotary embeddings to the query and key states
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        
+        if use_cache:
+            # update and retrieve kv caches
+            self.cache_k[:bsz, start_pos: start_pos + q_len] = key_states
+            self.cache_v[:bsz, start_pos: start_pos + q_len] = value_states
+            
+            key_states = self.cache_k[:bsz, : start_pos + q_len]
+            value_states = self.cache_v[:bsz, : start_pos + q_len]
 
         # Copy kv for matching the number of heads
         key_states = repeat_kv(key_states, self.num_key_value_groups)
@@ -158,6 +175,16 @@ class GQAAttention(nn.Module):
         # applied scaled dot product attention
         # attn_weights has shape (batch_size, num_heads, seq_len, seq_len)
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+
+        # add mask
+        if self.causal_attention:
+            if not use_cache:
+                mask = self.mask[:q_len, :q_len].bool()
+            else:
+                kv_len = len(self.cache_k)
+                mask = self.mask[kv_len - start_pos: kv_len, :kv_len ].bool()
+            
+            attn_weights.masked_fill(mask, -torch.inf)
 
         # upcast attention to fp32
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
@@ -175,7 +202,7 @@ class GQAAttention(nn.Module):
 
         return attn_output
 
-class LlamaMLP(nn.Module):
+class FeedForwardMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -200,14 +227,16 @@ class RotaryDecoderLayer(nn.Module):
 
         self.self_attn = GQAAttention(config=config, layer_idx=layer_idx)
         # FFN layer
-        self.mlp = LlamaMLP(config)
+        self.mlp = FeedForwardMLP(config)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings: Tuple[torch.Tensor, torch.Tensor]
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        use_cache: bool = False,
+        start_pos: int = 0
     ):
         """
         Args:
@@ -224,6 +253,8 @@ class RotaryDecoderLayer(nn.Module):
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
             position_embeddings=position_embeddings,
+            use_cache=use_cache,
+            start_pos=start_pos
         )
         hidden_states = residual + hidden_states
 
@@ -255,17 +286,19 @@ class RotaryDecoderModel(nn.Module):
         )
         
         # apply to last layer hidden state
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = RMSNorm(config.hidden_size, eps=config.get("rms_norm_eps",1e-6))
         # rotary embedding matrices are shared across the decoder layers
         self.rotary_emb = RotaryEmbedding( dim=config.hidden_size // config.num_heads,
                                                 max_position_embeddings=config.max_position_embeddings,
-                                                base=config.rope_theta,)
+                                                base=config.get("rope_theta", 10000),)
 
         
     def forward(
         self,
         input_ids: torch.LongTensor = None,
         position_ids: Optional[torch.LongTensor] = None,
+        use_cache: bool = False,
+        start_pos: int = 0
     ):
 
         inputs_embeds = self.embed_tokens(input_ids)
@@ -274,15 +307,18 @@ class RotaryDecoderModel(nn.Module):
 
         # create position embeddings to be shared across the decoder layers
         if position_ids is None:
-            position_ids = torch.arange(input_ids.shape[1], dtype=torch.int64, device=hidden_states.device)
-            position_ids = position_ids.expand(input_ids.shape[0], -1)
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+            bsz, seq_len = input_ids.shape
+            position_ids = torch.arange(start=start_pos, end=start_pos + seq_len, dtype=torch.int64, device=hidden_states.device)
+            position_ids = position_ids.expand(bsz, -1)
+        position_embeddings = self.rotary_emb(position_ids, datatype=hidden_states.dtype)
 
         for decoder_layer in self.layers:
 
             hidden_states = decoder_layer(
                 hidden_states,
                 position_embeddings=position_embeddings,
+                use_cache=use_cache,
+                start_pos=start_pos
             )
 
         hidden_states = self.norm(hidden_states)

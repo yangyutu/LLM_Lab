@@ -9,7 +9,12 @@ from omegaconf import OmegaConf
 import tiktoken
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, d_model, context_length, num_heads, dropout, qkv_bias=False, causal_attention=True):
+    def __init__(self, d_model, 
+                 context_length, 
+                 num_heads, 
+                 dropout, 
+                 qkv_bias=False, 
+                 causal_attention=True):
         super().__init__()
         
         assert d_model % num_heads == 0
@@ -112,7 +117,7 @@ class TransformerLayer(nn.Module):
                                       num_heads=config.num_heads,
                                       dropout=config.dropout,
                                       qkv_bias=config.qkv_bias,
-                                      causal_attention=config.causal_attention)
+                                      causal_attention=config.get("causal_attention",False))
         
         self.ff = FeedForward(d_model=config.d_model)
         self.norm1 = LayerNorm(d_model=config.d_model)
@@ -141,7 +146,7 @@ class TransformerLayer(nn.Module):
 class VanillaDecoderModel(nn.Module):
     def __init__(self, config):
         super().__init__()
-        print("vanilla decoder model 3")
+        print("vanilla decoder model 4")
         self.config = config
         # both token embedding and position embedding are learnable
         self.token_emb = nn.Embedding(config.vocab_size, config.d_model)
@@ -165,10 +170,10 @@ class VanillaDecoderModel(nn.Module):
             module.weight.data.normal_(0.0, 0.02)
 
 
-    def forward(self, input_idx):
-        (batch_size, num_tokens) = input_idx.shape
+    def forward(self, input_ids):
+        (batch_size, num_tokens) = input_ids.shape
         
-        token_embedings = self.token_emb(input_idx)
+        token_embedings = self.token_emb(input_ids)
         position_idx = self.position_ids[:, :num_tokens]
         pos_embeddings = self.pos_emb(position_idx)
         
