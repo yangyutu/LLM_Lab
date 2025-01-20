@@ -34,11 +34,14 @@ def rotate_half(x):
     x2 = x[..., x.shape[-1] // 2 :] # x2 is the second half of the hidden dims
     return torch.cat((-x2, x1), dim=-1)
 
-# q (`torch.Tensor`): The query tensor, which has shape [batch_size, heads, seq_len, head_dim].
+# cos, sin has shape of (batch_size, seq_len, dim)
+# if q has shape of [batch_size, heads, seq_len, head_dim], use unsqueeze_dim=1
+# if q has shape of [batch_size, seq_len, heads, head_dim], use unsqueeze_dim=2
+
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
 
     # add a dimension to the cos and sin tensors to account for the number of heads
-    # from (batch_size, seq_len, dim) to (batch_size, 1, seq_len, dim)
+    # from (batch_size, seq_len, dim) to (batch_size, 1, seq_len, dim) or (batch_size, seq_len, 1, dim)
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
     # Here has a different order in the frequency dimension, as described in the paper https://arxiv.org/pdf/2104.09864 page 7
@@ -133,8 +136,8 @@ class GQAAttention(nn.Module):
             self.register_buffer("mask", torch.triu(torch.ones(config.max_position_embeddings, config.max_position_embeddings), diagonal=1))
         
         if config.get("use_cache", False):
-            self.cache_k = torch.zeros((config.max_batch_size, config.max_seq_len, config.num_key_value_heads, self.head_dim))
-            self.cache_v = torch.zeros((config.max_batch_size, config.max_seq_len, config.num_key_value_heads, self.head_dim))
+            self.cache_k = torch.zeros((config.cache_max_batch_size, config.cache_max_seq_len, config.num_key_value_heads, self.head_dim))
+            self.cache_v = torch.zeros((config.cache_max_batch_size, config.cache_max_seq_len, config.num_key_value_heads, self.head_dim))
             
     def forward(
         self,
@@ -151,27 +154,40 @@ class GQAAttention(nn.Module):
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        # after transpose, the shape is (bsz, num_heads, q_len, head_dim)
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
 
         # Get the rotary embeddings cosines and sines functions
         cos, sin = position_embeddings
                
         # apply the rotary embeddings to the query and key states
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, unsqueeze_dim=2)
         
         if use_cache:
             # update and retrieve kv caches
+            self.cache_k = self.cache_k.to(key_states.device)
+            self.cache_v = self.cache_v.to(value_states.device)
+            
             self.cache_k[:bsz, start_pos: start_pos + q_len] = key_states
             self.cache_v[:bsz, start_pos: start_pos + q_len] = value_states
             
             key_states = self.cache_k[:bsz, : start_pos + q_len]
             value_states = self.cache_v[:bsz, : start_pos + q_len]
 
+        # after transpose, the shape is (bsz, num_heads, q_len, head_dim)
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
+
+
         # Copy kv for matching the number of heads
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
+        
+        
+        
         # applied scaled dot product attention
         # attn_weights has shape (batch_size, num_heads, seq_len, seq_len)
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
@@ -181,7 +197,7 @@ class GQAAttention(nn.Module):
             if not use_cache:
                 mask = self.mask[:q_len, :q_len].bool()
             else:
-                kv_len = len(self.cache_k)
+                kv_len = start_pos + q_len
                 mask = self.mask[kv_len - start_pos: kv_len, :kv_len ].bool()
             
             attn_weights.masked_fill(mask, -torch.inf)

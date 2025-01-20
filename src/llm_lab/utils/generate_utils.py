@@ -25,18 +25,18 @@ def generate(model,
     total_len = max_prompt_len + max_new_tokens
     
     # every token is defaulted to pad_token_id
-    tokens = torch.full((batch_size, total_len), pad_token_id, dtype=torch.long)
-    
+    tokens = torch.full((batch_size, total_len), pad_token_id, dtype=torch.long, device=device)
+    prompt_pad_mask = tokens == pad_token_id # True if the token is a prompt token, False otherwise
     for k, t in enumerate(prompt_tokens):
         # fill in existing prompt tokens
         tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device=device)
         
     eos_reached = torch.tensor([False] * batch_size, device=device)
     
-    for cur_pos in range(1, total_len):
+    for cur_pos in range(total_len - 1):
         
         with torch.no_grad():
-            logits = model(tokens[:,cur_pos-1:cur_pos], use_cashe=True, start_pos=cur_pos)
+            logits = model(tokens[:,cur_pos:cur_pos + 1], use_cache=True, start_pos=cur_pos)
 
             if greedy_decoding:
                 next_token = torch.argmax(logits[:,-1,:], dim=-1)
@@ -44,13 +44,13 @@ def generate(model,
                 raise NotImplementedError()
         
         # only replace toekn if it is a padding token
-        next_token = torch.where(tokens[:,cur_pos] == pad_token_id, next_token, tokens[:,cur_pos])
+        next_token = torch.where(prompt_pad_mask[:, cur_pos+1], next_token, tokens[:,cur_pos + 1])
         
-        tokens[:, cur_pos] = next_token
+        tokens[:, cur_pos + 1] = next_token
         
         # EOS is reachehed only if we found an EOS token for a padding position
         
-        eos_reached |= (prompt_tokens[:, cur_pos] == pad_token_id) & (next_token == eos_token_id)
+        eos_reached |= (prompt_pad_mask[:, cur_pos + 1]) & (next_token == eos_token_id)
         
         if all(eos_reached):
             break
@@ -60,8 +60,8 @@ def generate(model,
     
     for current_prompt_tokens in tokens.tolist():
         # cut to the EOS token if present
-        eos_idx = current_prompt_tokens.index(eos_token_id)
-        if eos_idx >= 0:
+        if eos_token_id in current_prompt_tokens:
+            eos_idx = current_prompt_tokens.index(eos_token_id)
             current_prompt_tokens = current_prompt_tokens[:eos_idx]
         
         out_tokens.append(current_prompt_tokens)
