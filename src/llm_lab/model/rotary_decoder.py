@@ -79,8 +79,7 @@ class RotaryEmbedding(nn.Module):
     @torch.no_grad()
     def forward(self, position_ids, datatype):
         # Core RoPE block
-        # Use None to add two new dimensions to the inv_freq
-        # use expand to repeat the inv_freq along the batch dimension
+        # Use None to add two new dimensions to the inv_freq and expand to repeat the inv_freq along the batch dimension
         # inv_freq_expanded has shape (batch_size, dim // 2, 1), dim // 2 is the number of frequencies
         # position_ids_expanded has shape (batch_size, 1, seq_len)
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
