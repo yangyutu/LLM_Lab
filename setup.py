@@ -12,8 +12,11 @@ setup(
     packages=find_packages(where='src'),  # Find packages in the 'src' directory
     install_requires=[
         # List any dependencies your package needs
-        'torch',
+        'torch==2.6.0',
         'transformers',
-        'datasets' 
+        'datasets',
+        'evaluate',
+        'omegaconf',
+        'scikit-learn' 
     ],
 )
